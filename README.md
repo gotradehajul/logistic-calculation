@@ -125,38 +125,54 @@ Design MySQL/MariaDB tables to find trucks within a given radius of a point, bas
 
 ### Schema
 
-```sql
--- Fast plate-number lookups
-CREATE TABLE trucks (
-    truck_id             INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    license_plate_number VARCHAR(20) NOT NULL,
-    created_at           DATETIME NULL,
-    updated_at           DATETIME NULL,
-    UNIQUE KEY idx_trucks_plate (license_plate_number)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+#### `trucks` — tens of thousands of rows · `ENGINE=InnoDB` · `utf8mb4_unicode_ci`
 
--- Full GPS history
-CREATE TABLE location_history (
-    id        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    truck_id  INT UNSIGNED NOT NULL,
-    timestamp DATETIME NOT NULL,          -- DATETIME avoids Year-2038 problem
-    latitude  DECIMAL(10, 7) NOT NULL,    -- ~1 cm precision
-    longitude DECIMAL(11, 7) NOT NULL,
-    address   VARCHAR(500) NULL,
-    KEY idx_lh_truck_ts (truck_id, timestamp),
-    FOREIGN KEY (truck_id) REFERENCES trucks(truck_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+| Column | Type | Null | Key | Notes |
+|---|---|---|---|---|
+| `truck_id` | `INT UNSIGNED` | NO | PRIMARY | Auto-increment |
+| `license_plate_number` | `VARCHAR(20)` | NO | UNIQUE `idx_trucks_plate` | Case-insensitive lookup; UNIQUE doubles as the query index |
+| `created_at` | `DATETIME` | YES | — | |
+| `updated_at` | `DATETIME` | YES | — | |
 
--- Denormalised "current location" — one row per truck, upserted on every ping
-CREATE TABLE truck_current_location (
-    truck_id  INT UNSIGNED PRIMARY KEY,
-    timestamp DATETIME NOT NULL,
-    latitude  DECIMAL(10, 7) NOT NULL,
-    longitude DECIMAL(11, 7) NOT NULL,
-    KEY idx_current_loc_lat_lng (latitude, longitude),
-    FOREIGN KEY (truck_id) REFERENCES trucks(truck_id) ON DELETE CASCADE
-) ENGINE=InnoDB;
-```
+---
+
+#### `location_history` — millions to tens of millions of rows · `ENGINE=InnoDB` · `utf8mb4_unicode_ci`
+
+| Column | Type | Null | Key | Notes |
+|---|---|---|---|---|
+| `id` | `BIGINT UNSIGNED` | NO | PRIMARY | Auto-increment |
+| `truck_id` | `INT UNSIGNED` | NO | INDEX (leading) | FK → `trucks.truck_id` |
+| `timestamp` | `DATETIME` | NO | INDEX (trailing) | `DATETIME` avoids the Year-2038 problem of `TIMESTAMP` |
+| `latitude` | `DECIMAL(10,7)` | NO | — | Range `[-90, 90]`, ~1 cm precision |
+| `longitude` | `DECIMAL(11,7)` | NO | — | Range `[-180, 180]`, ~1 cm precision |
+| `address` | `VARCHAR(500)` | YES | — | Reverse-geocoded human-readable label |
+
+**Indexes**
+
+| Name | Columns | Purpose |
+|---|---|---|
+| `PRIMARY` | `id` | Row identity |
+| `idx_lh_truck_ts` | `(truck_id, timestamp)` | Latest-location lookup per truck (`ORDER BY timestamp DESC LIMIT 1`) and history range queries |
+
+---
+
+#### `truck_current_location` — one row per truck · `ENGINE=InnoDB`
+
+> **Why this table exists:** finding the latest row per truck from `location_history` (tens of millions of rows) requires a `MAX(timestamp)` subquery or `GROUP BY` — both scan a large fraction of the table. By materialising the current location here and upserting on every GPS ping, the radius search only touches this small table.
+
+| Column | Type | Null | Key | Notes |
+|---|---|---|---|---|
+| `truck_id` | `INT UNSIGNED` | NO | PRIMARY | FK → `trucks.truck_id`; one row per truck |
+| `timestamp` | `DATETIME` | NO | — | Time of the most recent ping |
+| `latitude` | `DECIMAL(10,7)` | NO | INDEX (leading) | Used by bounding-box filter |
+| `longitude` | `DECIMAL(11,7)` | NO | INDEX (trailing) | Used by bounding-box filter |
+
+**Indexes**
+
+| Name | Columns | Purpose |
+|---|---|---|
+| `PRIMARY` | `truck_id` | One-row-per-truck identity |
+| `idx_current_loc_lat_lng` | `(latitude, longitude)` | B-tree range scan for bounding-box `WHERE` clause |
 
 ### Radius query (two-pass)
 
